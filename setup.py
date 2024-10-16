@@ -19,6 +19,7 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME, HIP_HOME
+import intel_extension_for_pytorch as ipex
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -120,12 +121,47 @@ def check_if_cuda_home_none(global_option: str) -> None:
 def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", "4"]
 
+def get_sycl_version(oneapi_dir):
+    dpcpp_bin = "dpcpp" if oneapi_dir is None else os.path.join(oneapi_dir, "bin", "dpcpp")
+    try:
+        raw_output = subprocess.check_output(
+            [dpcpp_bin, "--version"], universal_newlines=True
+        )
+    except Exception as e:
+        print(
+            f"oneAPI installation not found: {e} ONEAPI_PATH={os.environ.get('ONEAPI_PATH')}"
+        )
+        return None, None
+    
+    for line in raw_output.split("\n"):
+        if "oneAPI DPC++ Compiler" in line:
+            sycl_version = parse(line.split()[-1].replace("-", "+")) # local version is not parsed correctly
+            return line, sycl_version
+
+    return None, None
+
+
+def check_if_oneapi_home_none(global_option: str) -> None:
+    if os.getenv("ONEAPI_HOME") is not None:
+        return
+    # warn instead of error because user could be downloading prebuilt wheels, so dpcpp won't be necessary
+    # in that case.
+    warnings.warn(
+        f"{global_option} was requested, but dpcpp was not found.  Are you sure your environment has dpcpp available?"
+    )
 
 cmdclass = {}
 ext_modules = []
 
 
 HIP_BUILD = bool(torch.version.hip)
+
+# Check if IPEX is installed
+try:
+    SYCL_BUILD = bool(ipex.__version__)
+except ImportError:
+    SYCL_BUILD = False
+
 
 if not SKIP_CUDA_BUILD:
 
@@ -157,6 +193,23 @@ if not SKIP_CUDA_BUILD:
                 )
 
         cc_flag.append("-DBUILD_PYTHON_PACKAGE")
+
+    elif SYCL_BUILD:
+        check_if_oneapi_home_none(PACKAGE_NAME)
+
+        oneapi_home = os.getenv("ONEAPI_HOME")
+        _, sycl_version = get_sycl_version(oneapi_home)
+
+        if os.getenv("ONEAPI_HOME") is not None:
+            if sycl_version < Version("2023.0"):
+                raise RuntimeError(
+                    f"{PACKAGE_NAME} is only supported on oneAPI 2023.0 and above.  "
+                    "Note: make sure oneAPI has a supported version by running dpcpp --version."
+                )
+
+        cc_flag.append("-fsycl")
+        cc_flag.append("-fsycl-unnamed-lambda")
+        cc_flag.append("-fsycl-device-code-split=per_kernel")
 
     else:
         check_if_cuda_home_none(PACKAGE_NAME)
@@ -228,19 +281,34 @@ if not SKIP_CUDA_BUILD:
             ),
         }
 
-    ext_modules.append(
-        CUDAExtension(
-            name="causal_conv1d_cuda",
-            sources=[
-                "csrc/causal_conv1d.cpp",
-                "csrc/causal_conv1d_fwd.cu",
-                "csrc/causal_conv1d_bwd.cu",
-                "csrc/causal_conv1d_update.cu",
-            ],
-            extra_compile_args=extra_compile_args,
-            include_dirs=[Path(this_dir) / "csrc" / "causal_conv1d"],
+    if SYCL_BUILD:
+        ext_modules.append(
+            CppExtension(
+                name="causal_conv1d_sycl",
+                sources=[
+                    "dpctsrc/causal_conv1d.cpp.dp.cpp",
+                    "dpctsrc/causal_conv1d_fwd.cpp.dp.cpp",
+                    "dpctsrc/causal_conv1d_bwd.cpp.dp.cpp",
+                    "dpctsrc/causal_conv1d_update.cpp.dp.cpp",
+                ],
+                extra_compile_args=extra_compile_args,
+                include_dirs=[Path(this_dir) / "csrc" / "causal_conv1d"],
+            )
         )
-    )
+    else:
+        ext_modules.append(
+            CUDAExtension(
+                name="causal_conv1d_cuda",
+                sources=[
+                    "csrc/causal_conv1d.cpp",
+                    "csrc/causal_conv1d_fwd.cu",
+                    "csrc/causal_conv1d_bwd.cu",
+                    "csrc/causal_conv1d_update.cu",
+                ],
+                extra_compile_args=extra_compile_args,
+                include_dirs=[Path(this_dir) / "csrc" / "causal_conv1d"],
+            )
+        )
 
 
 def get_package_version():
@@ -252,7 +320,6 @@ def get_package_version():
         return f"{public_version}+{local_version}"
     else:
         return str(public_version)
-
 
 def get_wheel_url():
 
@@ -333,6 +400,7 @@ setup(
         exclude=(
             "build",
             "csrc",
+            "dpctsrc",
             "include",
             "tests",
             "dist",
